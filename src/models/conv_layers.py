@@ -12,17 +12,33 @@ from torch_scatter import scatter
 
 
 class GINConv(BaseGINConv):
-    def forward(self, x: Union[Tensor, OptPairTensor], edge_index: Adj, edge_attr: OptTensor = None, edge_atten: OptTensor = None, size: Size = None) -> Tensor:
+    def forward(self, x: Union[Tensor, OptPairTensor], edge_index: Adj, edge_attr: OptTensor = None, edge_atten: OptTensor = None, size: Size = None, action=True, mess=None) -> Tensor:
         """"""
         if isinstance(x, Tensor):
             x: OptPairTensor = (x, x)
-
+        if mess is not None:
+            print(mess, " to forward::conv_layers.py")
         # propagate_type: (x: OptPairTensor)
         out = self.propagate(edge_index, x=x, edge_atten=edge_atten, size=size)
-
+        node_atten = None
+        
+        if edge_index is not None and edge_atten is not None: # assumes graph is connected otherwise produces NaN for node_atten
+            node_atten = scatter(edge_atten, edge_index[0], dim=0, dim_size=x[0].shape[0], reduce='mean')
+            #print(f'node_atten: {node_atten.shape}, edge_atten: {edge_atten.shape}, edge_index: {edge_index.shape}')
+            
         x_r = x[1]
         if x_r is not None:
-            out += (1 + self.eps) * x_r
+            #print("x_r shape: ", x_r.shape)
+            #print("eps shape: ", self.eps.shape)
+            # eps_proj = 0.5 * (self.eps - self.eps.T)
+            eps_proj = 0.5 * self.eps
+            print('selfeps: ', self.eps)
+            if node_atten is not None and action is True: 
+                print("using node attention and group action in forward:conv_layers.py")
+                out += x_r + node_atten * x_r @ eps_proj # will throw error if node_atten is not defined
+            else: 
+                out += (1 + 0) * x_r
+        #print("out.shape: ", out.shape)
 
         return self.nn(out)
 

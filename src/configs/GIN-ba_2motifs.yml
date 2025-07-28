@@ -27,6 +27,11 @@ GSAT_config:
   lr: 1.0e-3
   pred_loss_coef: 1
   info_loss_coef: 1
+  inv_loss_coeff: 1
+  sparse_loss_coeff: 0.1
+  sym_loss_coeff: 1
+  #entropy_loss_coeff: 1
+  #neigh_loss_coeff: 1
 
   from_scratch: true # if false, will finetune GSAT based on a pre-trained model
   fix_r: false

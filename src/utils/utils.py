@@ -149,7 +149,16 @@ def visualize_a_graph(edge_index, edge_att, node_label, dataset_name, coor=None,
         nx.draw_networkx_edges(G, pos, width=1, edge_color='gray', arrows=False, alpha=0.1, ax=ax, connectionstyle='arc3,rad=0.4')
 
     fig = plt.gcf()
+    
+    #fig.canvas.draw()
+    #image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    #image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    
     fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    width, height = renderer.width, renderer.height
+
     image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    image = image.reshape((int(height), int(width), 3))
+    
     return fig, image

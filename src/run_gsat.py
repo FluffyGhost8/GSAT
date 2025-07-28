@@ -15,6 +15,12 @@ from torch_geometric.utils import subgraph, is_undirected
 from ogb.graphproppred import Evaluator
 from sklearn.metrics import roc_auc_score
 from rdkit import Chem
+from torch.nn import functional as F
+from typing import Tuple, Iterator
+from scipy.stats import truncnorm
+from torch_scatter import scatter
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
 
 from pretrain_clf import train_clf_one_seed
 from utils import Writer, Criterion, MLP, visualize_a_graph, save_checkpoint, load_checkpoint, get_preds, get_lr, set_seed, process_data
@@ -47,6 +53,12 @@ class GSAT(nn.Module):
         self.epochs = method_config['epochs']
         self.pred_loss_coef = method_config['pred_loss_coef']
         self.info_loss_coef = method_config['info_loss_coef']
+        
+        self.inv_loss_coeff = method_config['inv_loss_coeff']
+        self.sparse_loss_coeff = method_config['sparse_loss_coeff']
+        self.sym_loss_coeff = method_config['sym_loss_coeff']
+        #self.entropy_loss_coeff = method_config['entropy_loss_coeff']
+        #self.neigh_loss_coeff = method_config['neigh_loss_coeff']
 
         self.fix_r = method_config.get('fix_r', None)
         self.decay_interval = method_config.get('decay_interval', None)
@@ -56,8 +68,58 @@ class GSAT(nn.Module):
 
         self.multi_label = multi_label
         self.criterion = Criterion(num_class, multi_label)
+        
+        #self.rad = torch.nn.Parameter()
+        
+    def sim(self, a, b):
+        return F.cosine_similarity(a.T, b.T)
 
-    def __loss__(self, att, clf_logits, clf_labels, epoch):
+    def __loss__(self, att, clf_logits, clf_labels, epoch, old_emb, emb, edge_index, batch):   
+        old_preds = self.clf.get_pred_from_emb(old_emb, batch)
+        new_preds = self.clf.get_pred_from_emb(emb, batch)
+        # print('assdfads', att.shape)
+        inv_loss = 1 - self.sim(old_preds, new_preds)[0]
+        #print(inv_loss)
+        #print("number of nodes: ", old_emb.shape(0))
+        #print("pred from old_emb: ", self.clf.get_pred_from_emb(old_emb, batch))
+        sparse_loss = 1
+        print("att before node_att: ", att)
+        node_att = scatter(att, edge_index[0], dim=0, dim_size=emb.shape[0], reduce='mean')
+        s = 1 / (node_att + 1)
+        print("att after node_att: ", att)
+        # print("s: ", s.shape)
+        print("s: ", torch.isnan(s).any())
+        k = 1 / (s * np.sqrt(torch.pi/2) + self.extractor.radius[0:s.shape[0]])
+        f_area = 1 - k*s*np.sqrt(torch.pi/2)
+        
+        perts = torch.empty_like(s)
+        # print("perts: ", perts.shape)
+        # print("radius: ", self.extractor.radius.shape)
+        
+        choice = torch.rand(self.extractor.radius.shape[0], 1, device=self.extractor.radius.device)[0:s.shape[0]] < f_area
+        # print("choice: ", choice.shape)      
+        perts[choice] = torch.rand(choice.sum(), device=self.extractor.radius.device) * self.extractor.radius[0:s.shape[0]][choice]
+        choice = ~choice
+        g_samples = s.detach().numpy() * np.sqrt(2*torch.pi) * k.detach().numpy() * truncnorm.rvs(a=0, b=np.inf, loc=self.extractor.radius[0:s.shape[0]].detach().numpy(), scale=s.detach().numpy())
+        perts[choice] = torch.from_numpy(g_samples[choice]).float()
+        
+        perturbed_preds = self.clf.get_pred_from_emb(emb + perts, batch)
+        print("pred values: ", torch.sum(perturbed_preds), torch.sum(new_preds))
+        print("emb shape: ", emb.shape[0])
+        sym_loss = (F.kl_div(torch.log(perturbed_preds / torch.sum(perturbed_preds)) , new_preds / torch.sum(new_preds))) / (emb.shape[0])
+        # entropy_loss = 
+        # neigh_loss = a
+        
+        inv_loss = inv_loss * self.inv_loss_coeff
+        print('inv_loss: ', inv_loss)
+        sparse_loss = sparse_loss * self.sparse_loss_coeff
+        print('sparse_loss: ', sparse_loss)
+        sym_loss = sym_loss * self.sym_loss_coeff
+        print('sym_loss: ', sym_loss)
+        #entropy_loss = entropy_loss * self.entropy_loss_coeff
+        #neigh_loss = neigh_loss * self.neigh_loss_coeff
+        
+
         pred_loss = self.criterion(clf_logits, clf_labels)
 
         r = self.fix_r if self.fix_r else self.get_r(self.decay_interval, self.decay_r, epoch, final_r=self.final_r, init_r=self.init_r)
@@ -65,14 +127,24 @@ class GSAT(nn.Module):
 
         pred_loss = pred_loss * self.pred_loss_coef
         info_loss = info_loss * self.info_loss_coef
-        loss = pred_loss + info_loss
+        loss = pred_loss + info_loss + inv_loss + sym_loss
         loss_dict = {'loss': loss.item(), 'pred': pred_loss.item(), 'info': info_loss.item()}
+        #print(loss)
         return loss, loss_dict
 
     def forward_pass(self, data, epoch, training):
-        emb = self.clf.get_emb(data.x, data.edge_index, batch=data.batch, edge_attr=data.edge_attr)
-        att_log_logits = self.extractor(emb, data.edge_index, data.batch)
+        print('data: ', data)
+        print('data.x: ', data.x)
+        old_emb, emb = self.clf.get_emb(data.x, data.edge_index, batch=data.batch, edge_attr=data.edge_attr, action=True)
+        #print("old_emb: ", old_emb.shape)
+        #print("batch: ", data.batch.shape)
+        #print(data.edge_index.shape)
+        #print("aaaaaa", data.x.shape)
+        att_log_logits = self.extractor(emb, data.edge_index, data.batch, mess='from forward pass of rungsat.py')
+        print("att_log_logits", torch.isnan(att_log_logits).any())
         att = self.sampling(att_log_logits, epoch, training)
+        print("att: ", torch.isnan(att).any())
+        # print("att: ", att.shape)
 
         if self.learn_edge_att:
             if is_undirected(data.edge_index):
@@ -85,7 +157,7 @@ class GSAT(nn.Module):
             edge_att = self.lift_node_att_to_edge_att(att, data.edge_index)
 
         clf_logits = self.clf(data.x, data.edge_index, data.batch, edge_attr=data.edge_attr, edge_atten=edge_att)
-        loss, loss_dict = self.__loss__(att, clf_logits, data.y, epoch)
+        loss, loss_dict = self.__loss__(att, clf_logits, data.y, epoch, old_emb=old_emb, emb=emb, edge_index=data.edge_index, batch=data.batch)
         return edge_att, loss, loss_dict, clf_logits
 
     @torch.no_grad()
@@ -105,7 +177,41 @@ class GSAT(nn.Module):
         loss.backward()
         self.optimizer.step()
         return att.data.cpu().reshape(-1), loss_dict, clf_logits.data.cpu()
-
+    
+    def visualize_edge_perturbations(self, epoch, emb_2d, edge_index, a, A_phi_2d, topk=50):
+        """
+        emb_2d: [num_nodes, 2]  - 2D node embeddings (after PCA)
+        edge_index: [2, num_edges] - graph edge list
+        a: [num_edges, 1] - edge importance
+        A_phi_2d: [2, 2] - 2D antisymmetric matrix to perturb edges
+        """
+        emb = emb_2d.cpu().numpy()
+        edge_index = edge_index.cpu().numpy()
+        a = a.squeeze().cpu().numpy()  # shape [num_edges]
+        A_phi = A_phi_2d.cpu().numpy()  # shape [2, 2]    # Get top and bottom k edges by importance
+        topk_idx = np.argsort(a)[-topk:]
+        botk_idx = np.argsort(a)[:topk:]    
+        def plot_edges(idx_list, color, alpha, label):
+            # print(idx_list)
+            for idx in idx_list:
+                i, j = edge_index[:, idx]
+                # print(i, j)
+                xi, xj = emb[i], emb[j]
+                #print(xi, xj)
+                delta = A_phi @ (xj - xi)
+                #print(delta)
+                x_new = xi + delta            # Draw arrow from xi to xi + delta
+                plt.arrow(xi[0], xi[1], delta[0], delta[1], color=color, alpha=alpha, head_width=0.02, length_includes_head=True)    
+        plt.figure(figsize=(10, 8))
+        plt.scatter(emb[:, 0], emb[:, 1], s=10, color='gray', alpha=0.6, label='Node embeddings')    
+        plot_edges(topk_idx, color='red', alpha=0.8, label='Most important edges')
+        plot_edges(botk_idx, color='blue', alpha=0.5, label='Least important edges')    
+        plt.title(f"Perturbation Effects via $A_\\phi$ on Most/Least Important Edges")
+        plt.axis('off')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(f'figs/epoch_{epoch}.png')
+    
     def run_one_epoch(self, data_loader, epoch, phase, use_edge_attr):
         loader_len = len(data_loader)
         run_one_batch = self.train_one_batch if phase == 'train' else self.eval_one_batch
@@ -114,8 +220,13 @@ class GSAT(nn.Module):
         all_loss_dict = {}
         all_exp_labels, all_att, all_clf_labels, all_clf_logits, all_precision_at_k = ([] for i in range(5))
         pbar = tqdm(data_loader)
+        # print("pbar: ")
+        # for data in pbar:
+        #     print(data.x)
         for idx, data in enumerate(pbar):
             data = process_data(data, use_edge_attr)
+            #data.rad = torch.nn.Parameter(torch.ones(data.batch.size(0)))
+            # print("data: ", data)
             att, loss_dict, clf_logits = run_one_batch(data.to(self.device), epoch)
 
             exp_labels = data.edge_label.data.cpu()
@@ -134,9 +245,39 @@ class GSAT(nn.Module):
 
                 for k, v in all_loss_dict.items():
                     all_loss_dict[k] = v / loader_len
-                desc, att_auroc, precision, clf_acc, clf_roc, avg_loss = self.log_epoch(epoch, phase, all_loss_dict, all_exp_labels, all_att,
-                                                                                        all_precision_at_k, all_clf_labels, all_clf_logits, batch=False)
+                desc, att_auroc, precision, clf_acc, clf_roc, avg_loss = self.log_epoch(epoch, phase, all_loss_dict, all_exp_labels, all_att,all_precision_at_k, all_clf_labels, all_clf_logits, batch=False)
             pbar.set_description(desc)
+            
+        all_embs = []
+        all_atts = []
+        all_edge_indices = []        
+        for data in data_loader:
+            att, _, _ = self.eval_one_batch(data, epoch)
+            emb, trash = self.clf.get_emb(data.x, data.edge_index, batch=data.batch, edge_attr=data.edge_attr)  
+            all_embs.append(emb)
+            all_atts.append(att.view(-1, 1))
+            all_edge_indices.append(data.edge_index.T)  # shape [num_edges_in_batch, 2]
+            edge_index_last = data.edge_index
+            emb = torch.cat(all_embs, dim=0)
+        a = torch.cat(all_atts, dim=0)
+        # Concatenate all edge indices to match shape of `a`
+        # print('emb.shape: ', emb)
+        edge_index_full = torch.cat(all_edge_indices, dim=0).T  # shape [2, total_edges]        
+        pca = PCA(n_components=2)
+        emb_np = emb.detach().cpu().numpy()
+        emb_2d_np = pca.fit_transform(emb_np)
+        emb_2d = torch.tensor(emb_2d_np, dtype=torch.float32)
+        # print('emb_2d: ', emb_2d)
+        # emb_2d = torch.tensor(PCA(n_components=2).fit_transform(emb.detach().cpu().numpy()), dtype=torch.float32)
+        # Get PCA basis
+        W = torch.tensor(pca.components_.T, dtype=torch.float32)  # [D, 2]
+        param_dict = dict(self.clf.named_parameters())
+        A_phi = param_dict['convs.0.eps'].detach().cpu()  # [D, D]
+        A_phi_2d = W.T @ A_phi @ W
+        # A_phi_2d = 0.5 * (A_phi_2d - A_phi_2d.T)
+        A_phi_2d = 0.5 * A_phi_2d
+        self.visualize_edge_perturbations(epoch, emb_2d, edge_index_full, a, A_phi_2d, topk=50)
+        
         return att_auroc, precision, clf_acc, clf_roc, avg_loss
 
     def train(self, loaders, test_set, metric_dict, use_edge_attr):
@@ -153,10 +294,7 @@ class GSAT(nn.Module):
                 self.scheduler.step(valid_res[main_metric_idx])
 
             r = self.fix_r if self.fix_r else self.get_r(self.decay_interval, self.decay_r, epoch, final_r=self.final_r, init_r=self.init_r)
-            if (r == self.final_r or self.fix_r) and epoch > 10 and ((valid_res[main_metric_idx] > metric_dict['metric/best_clf_valid'])
-                                                                     or (valid_res[main_metric_idx] == metric_dict['metric/best_clf_valid']
-                                                                         and valid_res[4] < metric_dict['metric/best_clf_valid_loss'])):
-
+            if (r == self.final_r or self.fix_r) and epoch > 10 and ((valid_res[main_metric_idx] > metric_dict['metric/best_clf_valid']) or (valid_res[main_metric_idx] == metric_dict['metric/best_clf_valid'] and valid_res[4] < metric_dict['metric/best_clf_valid_loss'])):
                 metric_dict = {'metric/best_clf_epoch': epoch, 'metric/best_clf_valid_loss': valid_res[4],
                                'metric/best_clf_train': train_res[main_metric_idx], 'metric/best_clf_valid': valid_res[main_metric_idx], 'metric/best_clf_test': test_res[main_metric_idx],
                                'metric/best_x_roc_train': train_res[0], 'metric/best_x_roc_valid': valid_res[0], 'metric/best_x_roc_test': test_res[0],
@@ -253,6 +391,7 @@ class GSAT(nn.Module):
                 candidate_set = np.nonzero(y_dist == each_class)[0]
             idx = np.random.choice(candidate_set, self.num_viz_samples, replace=False)
             res.append((idx, tag))
+        print(res)
         return res
 
     def visualize_results(self, test_set, idx, epoch, tag, use_edge_attr):
@@ -316,22 +455,27 @@ class GSAT(nn.Module):
 
 
 class ExtractorMLP(nn.Module):
-
     def __init__(self, hidden_size, shared_config):
         super().__init__()
         self.learn_edge_att = shared_config['learn_edge_att']
         dropout_p = shared_config['extractor_dropout_p']
+        
+        self.radius = torch.nn.Parameter(torch.ones(10000,1))
 
         if self.learn_edge_att:
             self.feature_extractor = MLP([hidden_size * 2, hidden_size * 4, hidden_size, 1], dropout=dropout_p)
         else:
             self.feature_extractor = MLP([hidden_size * 1, hidden_size * 2, hidden_size, 1], dropout=dropout_p)
 
-    def forward(self, emb, edge_index, batch):
+    def forward(self, emb, edge_index, batch, mess=None):
+        if mess is not None:
+            print(mess, " to forward::ExtractorMLP")
+        print('emb in extractormlp forward: ', emb)
         if self.learn_edge_att:
             col, row = edge_index
             f1, f2 = emb[col], emb[row]
             f12 = torch.cat([f1, f2], dim=-1)
+            print('f12', f12)
             att_log_logits = self.feature_extractor(f12, batch[col])
         else:
             att_log_logits = self.feature_extractor(emb, batch)
@@ -376,6 +520,11 @@ def train_gsat_one_seed(local_config, data_dir, log_dir, model_name, dataset_nam
     extractor = ExtractorMLP(model_config['hidden_size'], shared_config).to(device)
     lr, wd = method_config['lr'], method_config.get('weight_decay', 0)
     optimizer = torch.optim.Adam(list(extractor.parameters()) + list(model.parameters()), lr=lr, weight_decay=wd)
+    #print(list(extractor.parameters()) + list(model.parameters()))
+    #print("optim: ", optimizer)
+    print("model: ")
+    for name, param in list(model.named_parameters()):
+        print(name, param.shape)
 
     scheduler_config = method_config.get('scheduler', {})
     scheduler = None if scheduler_config == {} else ReduceLROnPlateau(optimizer, mode='max', **scheduler_config)
