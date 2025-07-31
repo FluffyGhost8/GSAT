@@ -23,12 +23,12 @@ shared_config:
 
 GSAT_config:
   method_name: 'GSAT'
-  epochs: 100
+  epochs: 60
   lr: 1.0e-3
   pred_loss_coef: 1
   info_loss_coef: 1
   inv_loss_coeff: 1
-  sparse_loss_coeff: 0.1
+  sparse_loss_coeff: 1
   sym_loss_coeff: 1
   #entropy_loss_coeff: 1
   #neigh_loss_coeff: 1

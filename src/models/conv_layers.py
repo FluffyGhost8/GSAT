@@ -2,6 +2,7 @@ from typing import Union, Optional, List, Dict
 from torch_geometric.typing import OptPairTensor, Adj, OptTensor, Size, PairTensor
 
 import torch
+import numpy as np
 from torch import Tensor
 from torch_geometric.nn import GINEConv as BaseGINEConv, GINConv as BaseGINConv, LEConv as BaseLEConv
 from torch.nn import Sequential, Linear, ReLU
@@ -19,23 +20,32 @@ class GINConv(BaseGINConv):
         if mess is not None:
             print(mess, " to forward::conv_layers.py")
         # propagate_type: (x: OptPairTensor)
-        out = self.propagate(edge_index, x=x, edge_atten=edge_atten, size=size)
+        out = self.propagate(edge_index, x=x, size=size)
         node_atten = None
         
         if edge_index is not None and edge_atten is not None: # assumes graph is connected otherwise produces NaN for node_atten
-            node_atten = scatter(edge_atten, edge_index[0], dim=0, dim_size=x[0].shape[0], reduce='mean')
+            # node_atten = scatter(edge_atten, edge_index[0], dim=0, dim_size=x[0].shape[0], reduce='mean')
+            num_nodes = torch.max(edge_index)+1
+            np_edges = np.concatenate((edge_index[0].detach().cpu().numpy(), edge_index[1].detach().cpu().numpy()), axis=0)
+            np_attens = np.concatenate((edge_atten.detach().numpy(), edge_atten.detach().numpy()), axis=0).flatten()
+            sums = np.bincount(np_edges, weights=np_attens, minlength=num_nodes)
+            counts = np.bincount(np_edges, minlength=num_nodes)
+            # node_atten = sums/counts
+            node_atten = torch.from_numpy(sums/counts)
             #print(f'node_atten: {node_atten.shape}, edge_atten: {edge_atten.shape}, edge_index: {edge_index.shape}')
-            
+        # print("finished computing node atten in conv_layers")
         x_r = x[1]
         if x_r is not None:
             #print("x_r shape: ", x_r.shape)
             #print("eps shape: ", self.eps.shape)
             # eps_proj = 0.5 * (self.eps - self.eps.T)
             eps_proj = 0.5 * self.eps
-            print('selfeps: ', self.eps)
+            #print('selfeps: ', self.eps)
             if node_atten is not None and action is True: 
-                print("using node attention and group action in forward:conv_layers.py")
-                out += x_r + node_atten * x_r @ eps_proj # will throw error if node_atten is not defined
+                # print("using node attention and group action in forward:conv_layers.py")
+                print(node_atten.shape, x_r.shape, eps_proj.shape)
+                out += x_r.float() + node_atten.unsqueeze(1).float() * x_r.float() @ eps_proj.float() # will throw error if node_atten is not defined
+                # out += x_r.float() + x_r.float() @ eps_proj.float() # will throw error if node_atten is not defined yabbadabbadoo
             else: 
                 out += (1 + 0) * x_r
         #print("out.shape: ", out.shape)

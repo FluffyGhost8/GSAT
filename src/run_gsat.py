@@ -20,6 +20,7 @@ from typing import Tuple, Iterator
 from scipy.stats import truncnorm
 from torch_scatter import scatter
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 
 from pretrain_clf import train_clf_one_seed
@@ -30,7 +31,7 @@ from utils import get_local_config_name, get_model, get_data_loaders, write_stat
 class GSAT(nn.Module):
 
     def __init__(self, clf, extractor, optimizer, scheduler, writer, device, model_dir, dataset_name, num_class, multi_label, random_state,
-                 method_config, shared_config):
+                 method_config, shared_config, c1, c2, c3, c4, c5):
         super().__init__()
         self.clf = clf
         self.extractor = extractor
@@ -51,12 +52,12 @@ class GSAT(nn.Module):
         self.viz_norm_att = shared_config['viz_norm_att']
 
         self.epochs = method_config['epochs']
-        self.pred_loss_coef = method_config['pred_loss_coef']
-        self.info_loss_coef = method_config['info_loss_coef']
+        self.pred_loss_coef = c1
+        self.info_loss_coef = c2
         
-        self.inv_loss_coeff = method_config['inv_loss_coeff']
-        self.sparse_loss_coeff = method_config['sparse_loss_coeff']
-        self.sym_loss_coeff = method_config['sym_loss_coeff']
+        self.inv_loss_coeff = c3
+        self.sparse_loss_coeff = c4
+        self.sym_loss_coeff = c5
         #self.entropy_loss_coeff = method_config['entropy_loss_coeff']
         #self.neigh_loss_coeff = method_config['neigh_loss_coeff']
 
@@ -74,6 +75,35 @@ class GSAT(nn.Module):
     def sim(self, a, b):
         return F.cosine_similarity(a.T, b.T)
 
+    def f1_sparsity_loss(self, p_uv, y_uv, eps=1e-6):
+        # print(f"p_uv.shape: {p_uv.shape}, y_uv.shape: {y_uv.shape}")
+        # print("p_uv: ", p_uv)
+        # print("y_uv: ", y_uv)
+        TP = (p_uv.view(-1) * y_uv.view(-1)).sum()
+
+
+        # print(f"p_uv.shape: {p_uv.shape}, y_uv.shape: {y_uv.shape}")
+        # print("p_uv: ", p_uv)
+        # print("y_uv: ", y_uv)
+        # print("p_uv * y_uv: ", (p_uv.view(-1) * y_uv.view(-1)))
+        P = p_uv.sum()
+
+        G = y_uv.sum()
+
+        precision = TP / (P + eps)
+        recall = TP / (G + eps)
+
+        assert (p_uv >= 0).all() and (p_uv <= 1).all()
+        assert (y_uv >= 0).all() and (y_uv <= 1).all()
+
+        f1 = 2 * precision * recall / (precision + recall + eps)
+
+        l1_loss = p_uv.abs().mean()
+
+        total_loss = (1 - f1) + l1_loss
+
+        return total_loss
+    
     def __loss__(self, att, clf_logits, clf_labels, epoch, old_emb, emb, edge_index, batch):   
         old_preds = self.clf.get_pred_from_emb(old_emb, batch)
         new_preds = self.clf.get_pred_from_emb(emb, batch)
@@ -82,31 +112,52 @@ class GSAT(nn.Module):
         #print(inv_loss)
         #print("number of nodes: ", old_emb.shape(0))
         #print("pred from old_emb: ", self.clf.get_pred_from_emb(old_emb, batch))
-        sparse_loss = 1
-        print("att before node_att: ", att)
-        node_att = scatter(att, edge_index[0], dim=0, dim_size=emb.shape[0], reduce='mean')
-        s = 1 / (node_att + 1)
-        print("att after node_att: ", att)
+        param_dict = dict(self.clf.named_parameters())
+        eps_matrix = param_dict['convs.0.eps'].detach().cpu()
+        sparse_loss = 6 - torch.mean(torch.abs(eps_matrix))
+        print("att before node_att: ", att.shape)
+        #print("edge_index: ", edge_index, edge_index.shape)
+        
+        node_att = scatter(att, edge_index[0], dim=0, dim_size=emb.shape[0], reduce='mean').squeeze() # convert ba2motifs edge att to node att
+        # num_nodes = torch.max(edge_index)+1
+        # np_edges = np.concatenate((edge_index[0].detach().cpu().numpy(), edge_index[1].detach().cpu().numpy()), axis=0)
+        # np_attens = np.concatenate((att.detach().numpy(), att.detach().numpy()), axis=0).flatten()
+        # sums = np.bincount(np_edges, weights=np_attens, minlength=num_nodes)
+        # counts = np.bincount(np_edges, minlength=num_nodes)
+        # # node_att = sums/counts
+        # node_att = torch.from_numpy(sums/counts)
+        # print("att after node_att: ", node_att.shape)
+        s = 1 / (node_att + 1) # sigma
+        # print("s shape: ", s.shape, self.extractor.radius[0:s.shape[0]].shape)
         # print("s: ", s.shape)
-        print("s: ", torch.isnan(s).any())
-        k = 1 / (s * np.sqrt(torch.pi/2) + self.extractor.radius[0:s.shape[0]])
+        #print("s: ", torch.isnan(s).any())
+        k = 1 / (s * np.sqrt(torch.pi/2) + self.extractor.radius[0:s.shape[0]].squeeze()) # scale factor
+        # print("k shape: ", k.shape)
         f_area = 1 - k*s*np.sqrt(torch.pi/2)
         
-        perts = torch.empty_like(s)
+        perts = torch.empty_like(s).float()
         # print("perts: ", perts.shape)
         # print("radius: ", self.extractor.radius.shape)
         
-        choice = torch.rand(self.extractor.radius.shape[0], 1, device=self.extractor.radius.device)[0:s.shape[0]] < f_area
-        # print("choice: ", choice.shape)      
-        perts[choice] = torch.rand(choice.sum(), device=self.extractor.radius.device) * self.extractor.radius[0:s.shape[0]][choice]
+        choice = torch.rand(self.extractor.radius.shape[0], 1, device=self.extractor.radius.device)[0:s.shape[0]].squeeze() < f_area
+        # print("choice: ", choice.shape)
+        perts[choice] = torch.rand(choice.sum(), device=self.extractor.radius.device) * self.extractor.radius[0:s.shape[0]][choice].squeeze()
         choice = ~choice
-        g_samples = s.detach().numpy() * np.sqrt(2*torch.pi) * k.detach().numpy() * truncnorm.rvs(a=0, b=np.inf, loc=self.extractor.radius[0:s.shape[0]].detach().numpy(), scale=s.detach().numpy())
-        perts[choice] = torch.from_numpy(g_samples[choice]).float()
+        g_samples = s.detach().numpy() * np.sqrt(2*torch.pi) * k.detach().numpy() * truncnorm.rvs(a=0, b=np.inf, loc=self.extractor.radius[0:s.shape[0]].detach().numpy().squeeze(), scale=s.detach().numpy().squeeze())
+        # print("g_samples: ", g_samples.shape)
+        perts[choice] = torch.from_numpy(g_samples[choice].squeeze()).float().squeeze()
+        # print("perts: ", perts.shape)
+        # print("emb shape: ", emb.shape)
+        perts2 = torch.randn(emb.shape[0], 64, device=perts.device)
+        perts2 = perts2 / perts2.norm(dim=1, keepdim=True)
+        perts2 = perts2 * perts.unsqueeze(1)
         
-        perturbed_preds = self.clf.get_pred_from_emb(emb + perts, batch)
+        perturbed_preds = self.clf.get_pred_from_emb(emb + perts2, batch)
         print("pred values: ", torch.sum(perturbed_preds), torch.sum(new_preds))
-        print("emb shape: ", emb.shape[0])
-        sym_loss = (F.kl_div(torch.log(perturbed_preds / torch.sum(perturbed_preds)) , new_preds / torch.sum(new_preds))) / (emb.shape[0])
+        # print("perturbed preds: ", perturbed_preds)
+        # print("new preds: ", new_preds)
+        sym_loss = self.sim(perturbed_preds, new_preds) / (emb.shape[0])
+        # sym_loss = (F.kl_div(torch.log(perturbed_preds / torch.sum(perturbed_preds)) , new_preds / torch.sum(new_preds))) / (emb.shape[0])
         # entropy_loss = 
         # neigh_loss = a
         
@@ -127,20 +178,21 @@ class GSAT(nn.Module):
 
         pred_loss = pred_loss * self.pred_loss_coef
         info_loss = info_loss * self.info_loss_coef
-        loss = pred_loss + info_loss + inv_loss + sym_loss
+        loss = pred_loss + info_loss + sparse_loss
         loss_dict = {'loss': loss.item(), 'pred': pred_loss.item(), 'info': info_loss.item()}
         #print(loss)
         return loss, loss_dict
 
     def forward_pass(self, data, epoch, training):
         print('data: ', data)
-        print('data.x: ', data.x)
+        #print('data.x: ', data.x)
         old_emb, emb = self.clf.get_emb(data.x, data.edge_index, batch=data.batch, edge_attr=data.edge_attr, action=True)
-        #print("old_emb: ", old_emb.shape)
+        print("old_emb: ", old_emb.shape)
+        print("emb: ", emb.shape)
         #print("batch: ", data.batch.shape)
         #print(data.edge_index.shape)
         #print("aaaaaa", data.x.shape)
-        att_log_logits = self.extractor(emb, data.edge_index, data.batch, mess='from forward pass of rungsat.py')
+        att_log_logits = self.extractor(emb, data.edge_index, data.batch, mess=None)
         print("att_log_logits", torch.isnan(att_log_logits).any())
         att = self.sampling(att_log_logits, epoch, training)
         print("att: ", torch.isnan(att).any())
@@ -186,20 +238,23 @@ class GSAT(nn.Module):
         A_phi_2d: [2, 2] - 2D antisymmetric matrix to perturb edges
         """
         emb = emb_2d.cpu().numpy()
+        print("visualizing emb_2d: ", emb.shape)
         edge_index = edge_index.cpu().numpy()
         a = a.squeeze().cpu().numpy()  # shape [num_edges]
         A_phi = A_phi_2d.cpu().numpy()  # shape [2, 2]    # Get top and bottom k edges by importance
         topk_idx = np.argsort(a)[-topk:]
-        botk_idx = np.argsort(a)[:topk:]    
+        print("topk: ", topk_idx.shape)
+        botk_idx = np.argsort(a)[:topk:] 
+        print("bottomk: ", botk_idx.shape)
         def plot_edges(idx_list, color, alpha, label):
             # print(idx_list)
             for idx in idx_list:
                 i, j = edge_index[:, idx]
-                # print(i, j)
+                #print(i, j)
                 xi, xj = emb[i], emb[j]
-                #print(xi, xj)
+                #print("xixj: ", xi, xj)
                 delta = A_phi @ (xj - xi)
-                #print(delta)
+                # print("delta: ", delta)
                 x_new = xi + delta            # Draw arrow from xi to xi + delta
                 plt.arrow(xi[0], xi[1], delta[0], delta[1], color=color, alpha=alpha, head_width=0.02, length_includes_head=True)    
         plt.figure(figsize=(10, 8))
@@ -250,33 +305,114 @@ class GSAT(nn.Module):
             
         all_embs = []
         all_atts = []
-        all_edge_indices = []        
-        for data in data_loader:
-            att, _, _ = self.eval_one_batch(data, epoch)
-            emb, trash = self.clf.get_emb(data.x, data.edge_index, batch=data.batch, edge_attr=data.edge_attr)  
-            all_embs.append(emb)
-            all_atts.append(att.view(-1, 1))
-            all_edge_indices.append(data.edge_index.T)  # shape [num_edges_in_batch, 2]
-            edge_index_last = data.edge_index
-            emb = torch.cat(all_embs, dim=0)
-        a = torch.cat(all_atts, dim=0)
-        # Concatenate all edge indices to match shape of `a`
-        # print('emb.shape: ', emb)
-        edge_index_full = torch.cat(all_edge_indices, dim=0).T  # shape [2, total_edges]        
-        pca = PCA(n_components=2)
-        emb_np = emb.detach().cpu().numpy()
-        emb_2d_np = pca.fit_transform(emb_np)
-        emb_2d = torch.tensor(emb_2d_np, dtype=torch.float32)
-        # print('emb_2d: ', emb_2d)
-        # emb_2d = torch.tensor(PCA(n_components=2).fit_transform(emb.detach().cpu().numpy()), dtype=torch.float32)
-        # Get PCA basis
-        W = torch.tensor(pca.components_.T, dtype=torch.float32)  # [D, 2]
+        all_edge_indices = [] 
+        print("in run one epoch")
+        
         param_dict = dict(self.clf.named_parameters())
         A_phi = param_dict['convs.0.eps'].detach().cpu()  # [D, D]
-        A_phi_2d = W.T @ A_phi @ W
-        # A_phi_2d = 0.5 * (A_phi_2d - A_phi_2d.T)
-        A_phi_2d = 0.5 * A_phi_2d
-        self.visualize_edge_perturbations(epoch, emb_2d, edge_index_full, a, A_phi_2d, topk=50)
+        
+        for data in data_loader:
+            print("graphing data loop: ", data)
+            att, _, _ = self.eval_one_batch(data, epoch)
+            print("yz")
+            #emb, trash = self.clf.get_emb(data.x, data.edge_index, batch=data.batch, edge_attr=data.edge_attr) 
+            emb = self.clf.get_graph_emb(data.x, data.edge_index, batch=data.batch, edge_attr=data.edge_attr)
+            print("graphing single emb shape: ", emb)
+            all_embs.append(emb)
+            print("ab")
+            all_atts.append(att.view(-1, 1))
+            print("cd")
+            all_edge_indices.append(data.edge_index.T)  # shape [num_edges_in_batch, 2]
+            print("ef")
+            edge_index_last = data.edge_index
+            print("gh")
+            
+            with torch.no_grad():
+                p_np = emb.detach().cpu().numpy().astype(np.float32)
+                d_np = (emb @ A_phi).detach().cpu().numpy().astype(np.float32)
+                
+                print("emb shape:", emb.shape)
+                print("A_phi shape:", A_phi.shape)
+                print("d_np shape:", d_np.shape)
+
+                print("here2")
+                all_embeddings = np.vstack([p_np, d_np])
+                labels = np.array(['Primal'] * len(p_np) + ['Dual'] * len(d_np))
+
+                print("here3")
+                
+                tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+                emb_2d = tsne.fit_transform(all_embeddings)
+
+                print("here4")
+                plt.figure(figsize=(8, 6))
+
+                # Draw lines connecting matching primal/dual embeddings
+                print("here4")
+                for j in range(len(p_np)):
+                    p = emb_2d[j]
+                    d = emb_2d[j + len(p_np)]
+                    plt.plot([p[0], d[0]], [p[1], d[1]], color='gray', linewidth=0.5, alpha=0.4, zorder=1)
+
+                # Scatter points
+                plt.scatter(emb_2d[:len(p_np), 0], emb_2d[:len(p_np), 1], label='Primal', alpha=0.8, zorder=2)
+                plt.scatter(emb_2d[len(p_np):, 0], emb_2d[len(p_np):, 1], label='Dual', alpha=0.8, zorder=2)
+
+                plt.title(f"t-SNE: Primal vs Dual Graph Embeddings", fontsize = 20)
+                plt.legend(fontsize = 16)
+                plt.tight_layout()
+                plt.savefig(f'test/test_{epoch}')
+                plt.close()
+        emb = torch.cat(all_embs, dim=0)
+        a = torch.cat(all_atts, dim=0)
+        # # Concatenate all edge indices to match shape of `a`
+        # print("graphing embs shape: ", emb.shape)
+        # edge_index_full = torch.cat(all_edge_indices, dim=0).T  # shape [2, total_edges]        
+        # pca = PCA(n_components=2)
+        # emb_np = emb.detach().cpu().numpy()
+        # emb_2d_np = pca.fit_transform(emb_np)
+        # emb_2d = torch.tensor(emb_2d_np, dtype=torch.float32)
+        # print('emb_2d: ', emb_2d.shape)
+        # # emb_2d = torch.tensor(PCA(n_components=2).fit_transform(emb.detach().cpu().numpy()), dtype=torch.float32)
+        # # Get PCA basis
+        # W = torch.tensor(pca.components_.T, dtype=torch.float32)  # [D, 2]
+        # A_phi_2d = W.T @ A_phi @ W
+        # # A_phi_2d = 0.5 * (A_phi_2d - A_phi_2d.T)
+        # A_phi_2d = 0.5 * A_phi_2d
+        # self.visualize_edge_perturbations(epoch, emb_2d, edge_index_full, a, A_phi_2d, topk=50)
+        
+        # t-SNE projection
+        # with torch.no_grad():
+        #     p_np = emb.detach().cpu().numpy().astype(np.float32)
+        #     d_np = (emb @ A_phi).detach().cpu().numpy().astype(np.float32)
+            
+        #     print("emb shape:", emb.shape)
+        #     print("A_phi shape:", A_phi.shape)
+        #     print("d_np shape:", d_np.shape)
+
+        #     all_embeddings = np.vstack([p_np, d_np])
+        #     labels = np.array(['Primal'] * len(p_np) + ['Dual'] * len(d_np))
+
+        #     tsne = TSNE(n_components=2, perplexity=30, init='pca', random_state=42)
+        #     emb_2d = tsne.fit_transform(all_embeddings)
+
+        #     plt.figure(figsize=(8, 6))
+
+        #     # Draw lines connecting matching primal/dual embeddings
+        #     for j in range(len(p_np)):
+        #         p = emb_2d[j]
+        #         d = emb_2d[j + len(p_np)]
+        #         plt.plot([p[0], d[0]], [p[1], d[1]], color='gray', linewidth=0.5, alpha=0.4, zorder=1)
+
+        #     # Scatter points
+        #     plt.scatter(emb_2d[:len(p_np), 0], emb_2d[:len(p_np), 1], label='Primal', alpha=0.8, zorder=2)
+        #     plt.scatter(emb_2d[len(p_np):, 0], emb_2d[len(p_np):, 1], label='Dual', alpha=0.8, zorder=2)
+
+        #     plt.title(f"t-SNE: Primal vs Dual Graph Embeddings", fontsize = 20)
+        #     plt.legend(fontsize = 16)
+        #     plt.tight_layout()
+        #     plt.savefig(f'test/test_{epoch}.png')
+        #     plt.close()
         
         return att_auroc, precision, clf_acc, clf_roc, avg_loss
 
@@ -321,6 +457,8 @@ class GSAT(nn.Module):
                   f'Best Test X AUROC: {metric_dict["metric/best_x_roc_test"]:.3f}')
             print('====================================')
             print('====================================')
+            # with open('logsy.txt', 'a') as file:
+            #     file.write(f'[Seed {self.random_state}, Epoch: {epoch}]: Best Epoch: {metric_dict["metric/best_clf_epoch"]}, Best Val Pred ACC/ROC: {metric_dict["metric/best_clf_valid"]:.3f}, Best Test Pred ACC/ROC: {metric_dict["metric/best_clf_test"]:.3f}, Best Test X AUROC: {metric_dict["metric/best_x_roc_test"]:.3f}')
         return metric_dict
 
     def log_epoch(self, epoch, phase, loss_dict, exp_labels, att, precision_at_k, clf_labels, clf_logits, batch):
@@ -470,19 +608,19 @@ class ExtractorMLP(nn.Module):
     def forward(self, emb, edge_index, batch, mess=None):
         if mess is not None:
             print(mess, " to forward::ExtractorMLP")
-        print('emb in extractormlp forward: ', emb)
+       #print('emb in extractormlp forward: ', emb)
         if self.learn_edge_att:
             col, row = edge_index
             f1, f2 = emb[col], emb[row]
             f12 = torch.cat([f1, f2], dim=-1)
-            print('f12', f12)
+            #print('f12', f12)
             att_log_logits = self.feature_extractor(f12, batch[col])
         else:
             att_log_logits = self.feature_extractor(emb, batch)
         return att_log_logits
 
 
-def train_gsat_one_seed(local_config, data_dir, log_dir, model_name, dataset_name, method_name, device, random_state):
+def train_gsat_one_seed(local_config, data_dir, log_dir, model_name, dataset_name, method_name, device, random_state, c1, c2, c3, c4, c5):
     print('====================================')
     print('====================================')
     print(f'[INFO] Using device: {device}')
@@ -537,13 +675,24 @@ def train_gsat_one_seed(local_config, data_dir, log_dir, model_name, dataset_nam
 
     print('====================================')
     print('[INFO] Training GSAT...')
-    gsat = GSAT(model, extractor, optimizer, scheduler, writer, device, log_dir, dataset_name, num_class, aux_info['multi_label'], random_state, method_config, shared_config)
+    gsat = GSAT(model, extractor, optimizer, scheduler, writer, device, log_dir, dataset_name, num_class, aux_info['multi_label'], random_state, method_config, shared_config, c1, c2, c3, c4, c5)
     metric_dict = gsat.train(loaders, test_set, metric_dict, model_config.get('use_edge_attr', True))
     writer.add_hparams(hparam_dict=hparam_dict, metric_dict=metric_dict)
+    
+        
+    param_dict = dict(gsat.clf.named_parameters())
+    A_phi = param_dict['convs.0.eps'].detach().cpu()  # [D, D]
+    
+    file_path = 'my_tensor1.pt'
+
+    # Save the tensor to the file
+    torch.save(A_phi, file_path)
+    
+    
     return hparam_dict, metric_dict
 
 
-def main():
+def dwain(c1, c2, c3, c4, c5):
     import argparse
     parser = argparse.ArgumentParser(description='Train GSAT')
     parser.add_argument('--dataset', type=str, help='dataset used')
@@ -554,7 +703,7 @@ def main():
     model_name = args.backbone
     cuda_id = args.cuda
 
-    torch.set_num_threads(5)
+    torch.set_num_threads(1)
     config_dir = Path('./configs')
     method_name = 'GSAT'
 
@@ -576,7 +725,7 @@ def main():
     metric_dicts = []
     for random_state in range(num_seeds):
         log_dir = data_dir / dataset_name / 'logs' / (time + '-' + dataset_name + '-' + model_name + '-seed' + str(random_state) + '-' + method_name)
-        hparam_dict, metric_dict = train_gsat_one_seed(local_config, data_dir, log_dir, model_name, dataset_name, method_name, device, random_state)
+        hparam_dict, metric_dict = train_gsat_one_seed(local_config, data_dir, log_dir, model_name, dataset_name, method_name, device, random_state, c1, c2, c3, c4, c5)
         metric_dicts.append(metric_dict)
 
     log_dir = data_dir / dataset_name / 'logs' / (time + '-' + dataset_name + '-' + model_name + '-seed99-' + method_name + '-stat')
@@ -584,6 +733,15 @@ def main():
     writer = Writer(log_dir=log_dir)
     write_stat_from_metric_dicts(hparam_dict, metric_dicts, writer)
 
+def main():
+    for c1 in [1]:
+        for c2 in [1]:
+            for c3 in [1]:
+                for c4 in [0.01]:
+                    for c5 in [1]:
+                        # with open('logsy.txt', 'a') as file:
+                        #     file.write(f"new run: {c1}, {c2}, {c3}, {c4}, {c5}\n")
+                        dwain(c1, c2, c3, c4, c5)
 
 if __name__ == '__main__':
     main()

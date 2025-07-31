@@ -5,6 +5,7 @@ from torch.nn import Linear
 import torch.nn.functional as F
 from torch_geometric.nn import global_add_pool
 from ogb.graphproppred.mol_encoder import AtomEncoder, BondEncoder
+from torch_geometric.nn import global_add_pool
 
 from .conv_layers import GINConv, GINEConv
 
@@ -32,11 +33,11 @@ class GIN(nn.Module):
         self.pool = global_add_pool
         for _ in range(self.n_layers):
             if edge_attr_dim != 0 and self.use_edge_attr:
-                #print("GINE")
+                print("GINE")
                 self.convs.append(GINEConv(GIN.MLP(hidden_size, hidden_size), edge_dim=hidden_size))
             else:
-                #print("GIN")
-                self.convs.append(GINConv(GIN.MLP(hidden_size, hidden_size)))
+                print("GIN")
+                self.convs.append(GINConv(GIN.MLP(hidden_size, hidden_size), train_eps=True))
 
         self.fc_out = nn.Sequential(nn.Linear(hidden_size, 1 if num_class == 2 and not multi_label else num_class))
 
@@ -67,19 +68,19 @@ class GIN(nn.Module):
         )
 
     def get_emb(self, x, edge_index, batch, edge_attr=None, action=True, edge_atten=None):
-        print("pre: ", x, x.min(), x.max())
+        #print("pre: ", x, x.shape, x.min(), x.max())
         print("Any NaNs in x?", x.isnan().any().item())
-        print("weights: ", self.node_encoder.weight)
-        print("biases: ", self.node_encoder.bias)
+        #print("weights: ", self.node_encoder.weight)
+        #print("biases: ", self.node_encoder.bias)
         x = self.node_encoder(x)
         old_emb = x
-        print("post: ", x)
+        print("post: ", x, x.shape)
         if edge_attr is not None and self.use_edge_attr:
             edge_attr = self.edge_encoder(edge_attr)
 
         for i in range(self.n_layers):
             #print(f"pre conv {i}: ", x)
-            x = self.convs[i](x, edge_index, edge_attr=edge_attr, edge_atten=edge_atten, action=action, mess='from gin::get_emb')
+            x = self.convs[i](x, edge_index, edge_attr=edge_attr, edge_atten=edge_atten, action=action, mess=None)
             x = self.relu(x)
             x = F.dropout(x, p=self.dropout_p, training=self.training)
         # print('old_emb: ', old_emb)
@@ -88,3 +89,9 @@ class GIN(nn.Module):
 
     def get_pred_from_emb(self, emb, batch):
         return self.fc_out(self.pool(emb, batch))
+
+    def get_graph_emb(self, x, edge_index, batch, edge_attr=None, edge_atten=None):
+        node_emb = self.get_emb(x, edge_index, batch, edge_attr, edge_atten)[0]
+        print('batch: ', batch)
+        graph_emb = self.pool(node_emb, batch)
+        return graph_emb

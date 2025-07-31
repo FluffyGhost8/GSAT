@@ -7,10 +7,16 @@ import pickle as pkl
 from pathlib import Path
 from torch_geometric.data import InMemoryDataset, Data
 
+import matplotlib.pyplot as plt 
+import networkx as nx 
+from torch_geometric.utils import to_networkx
+from rdkit import Chem 
+
 
 class Mutag(InMemoryDataset):
     def __init__(self, root):
         super().__init__(root=root)
+        # self.process()
         self.data, self.slices = torch.load(self.processed_paths[0])
 
     @property
@@ -30,35 +36,67 @@ class Mutag(InMemoryDataset):
         with open(self.raw_dir + '/Mutagenicity.pkl', 'rb') as fin:
             _, original_features, original_labels = pkl.load(fin)
 
-        edge_lists, graph_labels, edge_label_lists, node_type_lists = self.get_graph_data()
+        #needs to be synced up to mutag_dual
+        with open(self.raw_dir + "/mask_log.txt", "w") as file:
 
-        data_list = []
-        for i in range(original_labels.shape[0]):
-            num_nodes = len(node_type_lists[i])
-            edge_index = torch.tensor(edge_lists[i], dtype=torch.long).T
+            edge_lists, graph_labels, edge_label_lists, node_type_lists = self.get_graph_data()
 
-            y = torch.tensor(graph_labels[i]).float().reshape(-1, 1)
-            x = torch.tensor(original_features[i][:num_nodes]).float()
-            assert original_features[i][num_nodes:].sum() == 0
-            edge_label = torch.tensor(edge_label_lists[i]).float()
-            if y.item() != 0:
-                edge_label = torch.zeros_like(edge_label).float()
+            data_list = []
+            for i in range(original_labels.shape[0]):
+                num_nodes = len(node_type_lists[i])
+                edge_index = torch.tensor(edge_lists[i], dtype=torch.long).T
 
-            node_label = torch.zeros(x.shape[0])
-            signal_nodes = list(set(edge_index[:, edge_label.bool()].reshape(-1).tolist()))
-            if y.item() == 0:
-                node_label[signal_nodes] = 1
+                y = torch.tensor(graph_labels[i]).float().reshape(-1, 1)
+                x = torch.tensor(original_features[i][:num_nodes]).float()
+                assert original_features[i][num_nodes:].sum() == 0
+                edge_label = torch.tensor(edge_label_lists[i]).float()
+                if y.item() != 0:
+                    edge_label = torch.zeros_like(edge_label).float()
 
-            if len(signal_nodes) != 0:
-                node_type = torch.tensor(node_type_lists[i])
-                node_type = set(node_type[signal_nodes].tolist())
-                assert node_type in ({4, 1}, {4, 3}, {4, 1, 3})  # NO or NH
+                node_label = torch.zeros(x.shape[0])
+                signal_nodes = list(set(edge_index[:, edge_label.bool()].reshape(-1).tolist()))
+                if y.item() == 0:
+                    node_label[signal_nodes] = 1
 
-            if y.item() == 0 and len(signal_nodes) == 0:
-                continue
+                if len(signal_nodes) != 0:
+                    node_type = torch.tensor(node_type_lists[i])
+                    node_type = set(node_type[signal_nodes].tolist())
+                    assert node_type in ({4, 1}, {4, 3}, {4, 1, 3})  # NO or NH
 
-            data_list.append(Data(x=x, y=y, edge_index=edge_index, node_label=node_label, edge_label=edge_label, node_type=torch.tensor(node_type_lists[i])))
+                if y.item() == 0 and len(signal_nodes) == 0:
+                    file.write("0\n")
+                    continue
+                
+                file.write("1\n")
+                if i<5:
+                    # print("\U0001F96D node_label.shape:", node_label.shape)
+                    # print("\U0001F96D I:", i)
+                    #try:
+                    if i < 5:
+                        # edge_index = torch.tensor([[0, 1, 0, 2, 1, 3],
+                        #        [1, 0, 2, 0, 3, 1]], dtype=torch.long)
+                        num_unique = torch.unique(edge_index).numel()
+                        # print("unique:", torch.unique(edge_index))
+                        # print ("\U0001F96D num_unique", num_unique)
+                        edge_att = torch.ones(edge_index.shape[1])
+                        # node_label = torch.zeros(4)
+                        #node_label = torch.zeros(num_unique)
+                        fig, ax = plt.subplots()
+                        fig.canvas.manager.set_window_title(f"Primal Graph v2 {i}")
+                        # print("\U0001F96D edge_index:", edge_index)
+                        # print("\U0001F96D edge_att:", edge_att)
+                        # print("\U0001F96D node_label:", node_label)
+                        # print("\U0001F96D node_label.size(0)", node_label.size(0))
+                        
+                        visualize_a_graph(edge_index, edge_att, node_label, 'mutag', ax, coor=None, norm=False, mol_type=None, nodesize=300)
+                        
+                        plt.show(block=True)
+                        plt.close(fig)
 
+                data_list.append(Data(x=x, y=y, edge_index=edge_index, node_label=node_label, edge_label=edge_label, node_type=torch.tensor(node_type_lists[i])))
+
+        print("len_primal_datalist: ", len(data_list))
+        input("continue check primal len")
         data, slices = self.collate(data_list)
         torch.save((data, slices), self.processed_paths[0])
 
@@ -142,3 +180,87 @@ class Mutag(InMemoryDataset):
         node_label_lists.append(node_label_list)
 
         return edge_lists, graph_labels, edge_label_lists, node_label_lists
+    
+def visualize_a_graph(edge_index, edge_att, node_label, dataset_name, ax, coor=None, norm=False, mol_type=None, nodesize=300):
+    if norm:  # for better visualization
+        edge_att = edge_att**10
+        edge_att = (edge_att - edge_att.min()) / (edge_att.max() - edge_att.min() + 1e-6)
+
+    if mol_type is None or dataset_name == 'Graph-SST2':
+        atom_colors = {0: '#E49D1C', 1: '#FF5357', 2: '#a1c569', 3: '#69c5ba'}
+        node_colors = [None for _ in range(node_label.shape[0])]
+        for y_idx in range(node_label.shape[0]):
+            node_colors[y_idx] = atom_colors[node_label[y_idx].int().tolist()]
+    else:
+        node_color = ['#29A329', 'lime', '#F0EA00',  'maroon', 'brown', '#E49D1C', '#4970C6', '#FF5357']
+        element_idxs = {k: Chem.PeriodicTable.GetAtomicNumber(Chem.GetPeriodicTable(), v) for k, v in mol_type.items()}
+        node_colors = [node_color[(v - 1) % len(node_color)] for k, v in element_idxs.items()]
+
+    #assert node_label.size(0) >= edge_index.max().item() + 1, "node_label too short"
+
+    data = Data(edge_index=edge_index, att=edge_att, y=node_label, num_nodes=node_label.size(0)).to('cpu')
+    G = to_networkx(data, node_attrs=['y'], edge_attrs=['att'])
+
+    # from itertools import combinations
+
+    # def repel_nodes(pos, min_dist=0.05):
+    #     for i, j in combinations(pos, 2):
+    #         pi, pj = pos[i], pos[j]
+    #         dist = np.linalg.norm(pi - pj)
+    #         if dist < min_dist:
+    #             direction = (pi - pj) / (dist + 1e-6)
+    #             shift = 0.5 * (min_dist - dist) * direction
+    #             pos[i] += shift
+    #             pos[j] -= shift
+    #     return pos
+
+    #pos = nx.kamada_kawai_layout(G)
+    #pos = repel_nodes(pos, min_dist=0.1)
+
+    # calculate Graph positions
+    if coor is None:
+        pos = nx.kamada_kawai_layout(G)
+        #pos = nx.spring_layout(G, seed=42)
+        # pos = repel_nodes(pos, min_dist=0.1)
+
+    else:
+        pos = {idx: each.tolist() for idx, each in enumerate(coor)}
+
+    for source, target, data in G.edges(data=True):
+        ax.annotate(
+            '', xy=pos[target], xycoords='data', xytext=pos[source],
+            textcoords='data', arrowprops=dict(
+                arrowstyle="->" if dataset_name == 'Graph-SST2' else '-',
+                lw=max(data['att'], 0) * 3,
+                alpha=max(data['att'], 0),  # alpha control transparency
+                color='black',  # color control color
+                shrinkA=np.sqrt(nodesize) / 2.0 + 1,
+                shrinkB=np.sqrt(nodesize) / 2.0 + 1,
+                connectionstyle='arc3,rad=0.4' if dataset_name == 'Graph-SST2' else 'arc3'
+            ))
+
+    if mol_type is not None:
+        nx.draw_networkx_labels(G, pos, mol_type, ax=ax)
+
+    if dataset_name != 'Graph-SST2':
+        nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=nodesize, ax=ax)
+        nx.draw_networkx_edges(G, pos, width=1, edge_color='gray', arrows=False, alpha=0.1, ax=ax)
+    else:
+        nx.draw_networkx_edges(G, pos, width=1, edge_color='gray', arrows=False, alpha=0.1, ax=ax, connectionstyle='arc3,rad=0.4')
+
+    labels = {i: str(i) for i in G.nodes}
+    nx.draw_networkx_labels(G, pos, labels, font_size=12, ax=ax)
+
+    # Get all x and y positions from the layout
+    x_values = [p[0] for p in pos.values()]
+    y_values = [p[1] for p in pos.values()]
+
+    # Compute padding and limits
+    x_margin = (max(x_values) - min(x_values)) * 0.2 + 0.1
+    y_margin = (max(y_values) - min(y_values)) * 0.2 + 0.1
+
+    ax.set_xlim(min(x_values) - x_margin, max(x_values) + x_margin)
+    ax.set_ylim(min(y_values) - y_margin, max(y_values) + y_margin)
+
+    ax.set_aspect('equal') #this
+    ax.axis('off') #this
